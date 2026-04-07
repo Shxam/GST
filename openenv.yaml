@@ -1,0 +1,287 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# OpenEnv Manifest — GST Reconciliation Environment
+# ──────────────────────────────────────────────────────────────────────────────
+name: gst-reconciliation-env
+version: "1.0.0"
+description: >
+  An OpenEnv-compliant reinforcement-learning environment for Indian GST
+  invoice reconciliation against GSTR-2B auto-generated ITC statements.
+  Agents must classify purchase invoices as MATCHED, MISMATCH, MISSING_IN_2B,
+  or EXTRA_IN_2B, identify mismatch fields, and compute claimable Input Tax
+  Credit (ITC) to maximise a graded reward signal.
+
+author: "GST Recon Team"
+license: MIT
+
+# ── Server ────────────────────────────────────────────────────────────────────
+server:
+  host: "0.0.0.0"
+  port: 7860
+  framework: fastapi
+  entry_point: "gst_env.main:app"
+  docs: "http://localhost:7860/docs"
+
+# ── Endpoints (OpenEnv spec) ──────────────────────────────────────────────────
+endpoints:
+  health:
+    path: /health
+    method: GET
+    description: Liveness probe — returns status and version
+
+  tasks:
+    path: /tasks
+    method: GET
+    description: List all available tasks with metadata
+
+  state:
+    path: /state
+    method: GET
+    description: Current environment state (task_id, episode_id, step, done)
+
+  reset:
+    path: /reset
+    method: POST
+    description: >
+      Reset environment and start a new episode.
+      Returns a full Observation with invoices and GSTR-2B entries.
+    body:
+      task_id:
+        type: string
+        enum: [task1_easy, task2_medium, task3_hard]
+        required: true
+
+  step:
+    path: /step
+    method: POST
+    description: >
+      Submit agent action. Returns (observation, reward, done, info).
+      This is a single-step environment — each episode ends after one step.
+    body: Action
+
+  grader:
+    path: /grader
+    method: POST
+    description: >
+      Grade an Action against ground truth without advancing the episode state.
+      Useful for evaluation and debugging.
+    body: Action
+
+  baseline:
+    path: /baseline
+    method: GET
+    description: >
+      Run the naive rule-based baseline agent on all three tasks.
+      Returns scores per task and average.
+
+# ── Tasks ─────────────────────────────────────────────────────────────────────
+tasks:
+  - id: task1_easy
+    difficulty: easy
+    num_invoices: 10
+    num_gstr2b_entries: 10
+    description: >
+      10 invoices, all perfectly matched in GSTR-2B.
+      Agent must classify all as MATCHED and compute the full claimable ITC.
+      No mismatches, no missing entries, no duplicates.
+    mismatch_types: []
+    reward_range: [0.0, 1.0]
+    scoring:
+      match_weight: 0.70
+      itc_weight: 0.30
+
+  - id: task2_medium
+    difficulty: medium
+    num_invoices: 50
+    num_gstr2b_entries: 48
+    description: >
+      50 invoices with 8 deliberate mismatches injected.
+      Mismatch types: amount deviation (±15%), date shift (5–30 days),
+      GSTIN character error, and missing from GSTR-2B.
+      Agent must correctly identify each mismatch type and compute ITC
+      only for MATCHED invoices.
+    mismatch_types:
+      - amount_deviation
+      - date_shift
+      - gstin_error
+      - missing_in_2b
+    reward_range: [0.0, 1.0]
+    scoring:
+      weighted_accuracy_weight: 0.40
+      itc_weight: 0.40
+      penalty_weight: 0.20
+      notes: "MISMATCH and MISSING_IN_2B errors carry 1.5x penalty weight"
+
+  - id: task3_hard
+    difficulty: hard
+    num_invoices: 200
+    num_gstr2b_entries: 190
+    description: >
+      200 invoices with all mismatch types: missing entries (20),
+      amount mismatch +20–50% (15), duplicate GSTR-2B entries causing
+      EXTRA_IN_2B (10), GSTIN character errors (10), and reverse charge
+      (itc_available=False, 5). A random penalty_days value (0–30) is
+      generated per episode, reducing the maximum achievable reward.
+      Agent must also identify the specific mismatch fields for each
+      MISMATCH entry to earn the field_detection_bonus.
+    mismatch_types:
+      - missing_in_2b
+      - amount_mismatch
+      - extra_in_2b_duplicate
+      - gstin_error
+      - reverse_charge
+    penalty_days_range: [0, 30]
+    reward_range: [0.0, 1.0]
+    scoring:
+      weighted_accuracy_weight: 0.35
+      itc_weight: 0.35
+      penalty_weight: 0.15
+      field_detection_bonus: 0.15
+      notes: "MISMATCH and MISSING_IN_2B errors carry 2.3x penalty weight"
+
+# ── Observation schema ────────────────────────────────────────────────────────
+observation:
+  task_id:
+    type: string
+    description: Active task identifier
+  episode_id:
+    type: string
+    description: UUID for the current episode
+  invoices:
+    type: array
+    items: Invoice
+    description: Purchase invoices to reconcile
+  gstr2b_entries:
+    type: array
+    items: GSTR2BEntry
+    description: Government-generated GSTR-2B entries for the tax period
+  tax_period:
+    type: string
+    description: Tax period in YYYY-YY format (e.g. 2024-25)
+  max_itc_possible:
+    type: Decimal
+    description: Maximum claimable ITC if all invoices were MATCHED
+  step_number:
+    type: integer
+    description: Current step within the episode (always 0 after reset)
+  instructions:
+    type: string
+    description: Human-readable task instructions
+
+# ── Invoice schema ────────────────────────────────────────────────────────────
+Invoice:
+  invoice_id: string
+  vendor_gstin: string        # 15-character GSTIN
+  invoice_number: string
+  invoice_date: date
+  taxable_value: Decimal
+  cgst: Decimal
+  sgst: Decimal
+  igst: Decimal
+  hsn_code: string
+  vendor_name: string
+
+# ── GSTR2BEntry schema ────────────────────────────────────────────────────────
+GSTR2BEntry:
+  supplier_gstin: string      # 15-character GSTIN
+  invoice_number: string
+  invoice_date: date
+  taxable_value: Decimal
+  cgst: Decimal
+  sgst: Decimal
+  igst: Decimal
+  itc_available: boolean
+  document_type: string       # default: "invoice"
+
+# ── Action schema ─────────────────────────────────────────────────────────────
+action:
+  reconciliation_result:
+    type: array
+    description: One entry per invoice — no omissions allowed
+    items:
+      invoice_id:
+        type: string
+      status:
+        type: string
+        enum: [MATCHED, MISMATCH, MISSING_IN_2B, EXTRA_IN_2B]
+      correction_note:
+        type: string|null
+        description: Optional human-readable explanation
+      mismatch_fields:
+        type: array
+        items: string
+        description: >
+          Fields that differ from the invoice. Use exact names:
+          taxable_value, invoice_date, supplier_gstin,
+          cgst, sgst, igst, itc_available
+  claimable_itc:
+    type: Decimal
+    description: Sum of (cgst+sgst+igst) for MATCHED invoices only
+  confidence:
+    type: float
+    range: [0.0, 1.0]
+    description: Agent's self-assessed confidence in the action
+
+# ── Reward schema ─────────────────────────────────────────────────────────────
+reward:
+  total:
+    type: float
+    description: Weighted composite score [0.0, 1.0]
+  match_score:
+    type: float
+    description: Fraction of invoices correctly classified
+  itc_score:
+    type: float
+    description: "max(0, 1 - |predicted_itc - true_itc| / true_itc)"
+  false_positive_penalty:
+    type: float
+    description: Reserved for future use
+  penalty_day_penalty:
+    type: float
+    description: "max(0, 1 - penalty_days / 30) — task3 only"
+  done:
+    type: boolean
+    description: Always true (single-step environment)
+  info:
+    correct_matches: integer
+    total_invoices: integer
+    episode_id: string
+    itc_error: float
+    task_score: float
+
+# ── Agent ─────────────────────────────────────────────────────────────────────
+agent:
+  strategy: hybrid
+  stage_1: deterministic_python_diff
+  stage_2: groq_llm_batched
+  model: llama-3.3-70b-versatile
+  batch_size: 10
+  batch_sleep_seconds: 65
+  description: >
+    Stage 1 resolves clear-cut MISSING, EXTRA, and MATCHED cases using a
+    Python field differ. Stage 2 sends only ambiguous invoices to the Groq
+    LLM in batches of 10 to stay within the 12K TPM free-tier limit.
+    ITC and mismatch_fields are always recomputed deterministically after
+    LLM classification.
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+docker:
+  image: gst-recon-env
+  build_command: "docker build -t gst-recon-env ."
+  run_command: "docker run -p 7860:7860 gst-recon-env"
+  port: 7860
+
+# ── Environment variables ─────────────────────────────────────────────────────
+environment_variables:
+  GROQ_API_KEY:
+    required: true
+    description: >
+      Groq API key for the agent runner.
+      Get a free key at https://console.groq.com/keys
+  BASE_URL:
+    required: false
+    default: "http://localhost:7860"
+    description: Server URL for the agent runner
+  GROQ_MODEL:
+    required: false
+    default: "llama-3.3-70b-versatile"
+    description: Groq model ID to use for ambiguous invoice classification
